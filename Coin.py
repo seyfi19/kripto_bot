@@ -7,7 +7,7 @@ import requests
 import os
 from threading import Thread
 
-# --- AYARLAR (Render Environment Variables'dan çeker) ---
+# --- AYARLAR ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 API_KEY = os.getenv('BTCTURK_API_KEY')
@@ -20,34 +20,24 @@ exchange = ccxt.btcturk({
     'enableRateLimit': True
 })
 
-# --- STRATEJİ PARAMETRELERİ ---
+# --- STRATEJİ ---
 TIMEFRAME = '5m'
 BAKIYE_ORANI = 0.90
-SABIT_STOP = 0.015       # %1.5 Zarar Kes
-TAKIP_TETIK = 0.02       # %2 Kar Takibi (Trailing)
-RSI_ESIK = 40            # Alım için RSI 40'ın altı
+SABIT_STOP = 0.015
+TAKIP_TETIK = 0.02
+RSI_ESIK = 40
 
-# Global Bellek (Botun o anki durumunu tutar)
-bellek = {
-    "aktif": False, 
-    "symbol": None, 
-    "ort": 0, 
-    "adet": 0, 
-    "zirve": 0, 
-    "son_tarama": []
-}
+bellek = {"aktif": False, "symbol": None, "ort": 0, "adet": 0, "zirve": 0, "son_tarama": []}
 
 def tg_mesaj(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except:
-        print("Telegram iletisi gönderilemedi.")
+        pass
 
-# --- TELEGRAM ETKİLEŞİM (Ayrı bir kolda çalışır) ---
 def telegram_dinle():
     offset = 0
-    print("SİSTEM: Telegram dinleyici başlatıldı.")
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=10"
@@ -56,27 +46,20 @@ def telegram_dinle():
                 offset = update["update_id"] + 1
                 msg = update.get("message", {})
                 text = msg.get("text", "")
-                
                 if text == "/rapor":
-                    # Hafızadaki son tarama sonuçlarını gönderir (Hızlı yanıt)
-                    t_list = "\n".join(bellek["son_tarama"][-15:]) if bellek["son_tarama"] else "Henüz tarama yapılmadı."
-                    tg_mesaj(f"📊 GÜNCEL RSI RAPORU (Eşik: {RSI_ESIK})\n\n{t_list}")
-                
+                    t_list = "\n".join(bellek["son_tarama"]) if bellek["son_tarama"] else "Tarama yapılıyor..."
+                    tg_mesaj(f"📊 RSI RAPORU (Eşik: {RSI_ESIK})\n\n{t_list}")
                 elif text == "/durum":
                     if bellek["aktif"]:
-                        curr = exchange.fetch_ticker(bellek["symbol"])['last']
-                        kz = ((curr - bellek["ort"]) / bellek["ort"]) * 100
-                        tg_mesaj(f"🛰 İŞLEM: {bellek['symbol']}\n📈 Kâr/Zarar: %{kz:.2f}\n📍 Giriş: {bellek['ort']}\n🔝 Zirve: {bellek['zirve']}")
+                        tg_mesaj(f"🛰 İŞLEMDE: {bellek['symbol']}\n📍 Giriş: {bellek['ort']}")
                     else:
-                        tg_mesaj("🤖 Bot Çalışıyor: Şu an boşta, fırsat kolluyor.")
-        except Exception as e:
-            print(f"Telegram Hatası: {e}")
+                        tg_mesaj("🤖 Boşta, fırsat kolluyor.")
+        except:
             time.sleep(5)
 
 def en_hareketli_15_coin():
     try:
         tickers = exchange.fetch_tickers()
-        # Sadece USDT paritelerini hacme göre sırala
         usdt_pairs = [t for t in tickers if '/USDT' in t]
         sorted_pairs = sorted(usdt_pairs, key=lambda x: tickers[x]['baseVolume'] or 0, reverse=True)
         return sorted_pairs[:15]
@@ -84,23 +67,45 @@ def en_hareketli_15_coin():
         return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'XRP/USDT']
 
 def run_bot():
-    global bellek
-    print(f"SİSTEM: Robot RSI {RSI_ESIK} modunda taramaya başlıyor...")
-    tg_mesaj(f"🚀 Robot RSI {RSI_ESIK} Modunda Aktif Edildi!\n\nKomutlar:\n/rapor - RSI listesini gör\n/durum - İşlem durumunu gör")
-    
+    print("SİSTEM: Robot RSI 40 modunda başladı.")
+    tg_mesaj("🚀 Robot RSI 40 Modunda Aktif!")
     while True:
         try:
             watchlist = en_hareketli_15_coin()
             yeni_tarama = []
-            
             for s in watchlist:
-                # RSI Hesaplama
                 bars = exchange.fetch_ohlcv(s, timeframe=TIMEFRAME, limit=50)
                 df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
                 rsi = ta.rsi(df['c'], length=14).iloc[-1]
                 yeni_tarama.append(f"{s}: {rsi:.1f}")
                 
-                # ALIM KOŞULU
                 if not bellek["aktif"] and rsi < RSI_ESIK:
                     ticker = exchange.fetch_ticker(s)
-                    price
+                    price = ticker['last']
+                    bal = exchange.fetch_balance()['total'].get('USDT', 0) * BAKIYE_ORANI
+                    if bal > 10:
+                        market = exchange.market(s)
+                        prec = market['precision']['amount']
+                        qty = math.floor(bal / price * (10**prec)) / (10**prec)
+                        exchange.create_market_buy_order(s, qty)
+                        bellek.update({"aktif": True, "symbol": s, "ort": price, "adet": qty, "zirve": price})
+                        tg_mesaj(f"✅ ALINDI: {s}\nFiyat: {price}")
+                        break
+            bellek["son_tarama"] = yeni_tarama
+            
+            if bellek["aktif"]:
+                curr = exchange.fetch_ticker(bellek["symbol"])['last']
+                if curr > bellek["zirve"]: bellek["zirve"] = curr
+                stop = max(bellek["ort"] * (1-SABIT_STOP), bellek["zirve"] * (1-TAKIP_TETIK))
+                if curr <= stop:
+                    exchange.create_market_sell_order(bellek["symbol"], bellek["adet"])
+                    tg_mesaj(f"📉 SATILDI: {bellek['symbol']}")
+                    bellek["aktif"] = False
+            time.sleep(30)
+        except Exception as e:
+            print(f"Hata: {e}")
+            time.sleep(30)
+
+if __name__ == "__main__":
+    Thread(target=telegram_dinle, daemon=True).start()
+    run_bot()
